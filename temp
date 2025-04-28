@@ -1,0 +1,168 @@
+import os
+import time
+import json
+import cv2
+import sqlite3
+import threading
+import logging
+import face_recognition
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file
+from werkzeug.utils import secure_filename
+from io import BytesIO
+from PIL import Image, ImageDraw
+from visitor_logs import init_db, log_visit, get_logs
+
+# Initialize
+init_db()
+logging.basicConfig(level=logging.DEBUG)
+
+# Constants
+CAPTURED_FACES_DIR = "captured_faces"
+KNOWN_FACES_DIR = "known_faces"
+LOG_SNAPSHOTS_DIR = "log_snapshots"
+CATEGORY_FILE = "categories.json"
+
+os.makedirs(CAPTURED_FACES_DIR, exist_ok=True)
+os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+os.makedirs(LOG_SNAPSHOTS_DIR, exist_ok=True)
+
+# Load category colors
+AVAILABLE_COLORS = {
+    "Red": (255, 0, 0),
+    "Green": (0, 255, 0),
+    "Blue": (0, 0, 255),
+    "Yellow": (255, 255, 0),
+    "Purple": (255, 0, 255),
+    "Cyan": (0, 255, 255),
+    "Maroon": (128, 0, 0),
+    "Olive": (128, 128, 0),
+    "Navy": (0, 0, 128)
+}
+used_colors = {}
+if os.path.exists(CATEGORY_FILE):
+    with open(CATEGORY_FILE, "r") as f:
+        used_colors = json.load(f)
+
+# Flask app
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = KNOWN_FACES_DIR
+
+@app.template_filter('datetimeformat')
+def datetimeformat(value):
+    try:
+        return datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return value
+
+# FaceDetector
+face_detector = None
+
+class FaceDetector:
+    def __init__(self, rtsp_url):
+        self.cap = cv2.VideoCapture(rtsp_url)
+        if not self.cap.isOpened():
+            raise RuntimeError("Camera stream failed to open.")
+
+        self.running = False
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.cooldown_time = 5
+        self.last_known_log_times = {}
+        self.last_unknown_save_time = 0
+
+        self.known_faces, self.known_names = self.load_known_faces()
+        self.category_colors = {
+            category: tuple(int(used_colors.get(category, "#FFFFFF").strip("#")[i:i+2], 16) for i in (0, 2, 4))
+            for category in used_colors
+        }
+
+    def load_known_faces(self):
+        faces = []
+        names = []
+        for category in os.listdir(KNOWN_FACES_DIR):
+            category_path = os.path.join(KNOWN_FACES_DIR, category)
+            if os.path.isdir(category_path):
+                for filename in os.listdir(category_path):
+                    if filename.endswith((".jpg", ".png")):
+                        img_path = os.path.join(category_path, filename)
+                        image = face_recognition.load_image_file(img_path)
+                        encodings = face_recognition.face_encodings(image)
+                        if encodings:
+                            faces.append(encodings[0])
+                            names.append((category, filename.split(".")[0]))
+        return faces, names
+
+    def detect_and_recognize_faces(self):
+        self.running = True
+        try:
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.1)
+                    continue
+
+                small_frame = cv2.resize(frame, (0, 0), fx=0.75, fy=0.75)
+                rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(rgb_small_frame, model='cnn')
+                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+
+                current_time = time.time()
+
+                for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                    scale = 1 / 0.75
+                    top, right, bottom, left = [int(coord * scale) for coord in (top, right, bottom, left)]
+
+                    name, category = "Unknown", "Unknown"
+                    matches = face_recognition.compare_faces(self.known_faces, face_encoding, tolerance=0.45)
+
+                    if True in matches:
+                        idx = matches.index(True)
+                        category, name = self.known_names[idx]
+
+                        last_log_time = self.last_known_log_times.get(name, 0)
+                        if current_time - last_log_time > 30:
+                            snapshot_path = os.path.join(LOG_SNAPSHOTS_DIR, f"{name}_{int(current_time)}.jpg")
+                            os.makedirs(LOG_SNAPSHOTS_DIR, exist_ok=True)
+                            face_crop = frame[top:bottom, left:right]
+                            cv2.imwrite(snapshot_path, face_crop)
+                            log_visit(name, category)
+                            self.last_known_log_times[name] = current_time
+
+                        color = self.category_colors.get(category, (255, 255, 255))
+                    else:
+                        color = (0, 0, 255)  # RED box for unknown
+
+                        if current_time - self.last_unknown_save_time > self.cooldown_time:
+                            unknown_dir = os.path.join(CAPTURED_FACES_DIR, "Unknown")
+                            os.makedirs(unknown_dir, exist_ok=True)
+                            unknown_path = os.path.join(unknown_dir, f"unknown_{int(current_time)}.jpg")
+                            face_crop = frame[top:bottom, left:right]
+                            cv2.imwrite(unknown_path, face_crop)
+                            self.last_unknown_save_time = current_time
+
+                    # Draw bounding box and label
+                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                    label = f"{category}: {name}" if name != "Unknown" else "Unknown"
+                    cv2.putText(frame, label, (left, top - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                with self.frame_lock:
+                    self.latest_frame = frame.copy()
+
+        except Exception as e:
+            logging.error(f"Detection error: {e}")
+        finally:
+            if self.cap:
+                self.cap.release()
+                try:
+                    cv2.destroyAllWindows()
+                except:
+                    pass
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+
+# ---- Flask routes go below (same as your last working ones) ----
