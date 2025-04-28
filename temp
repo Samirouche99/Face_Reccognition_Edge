@@ -165,4 +165,9 @@ class FaceDetector:
         if self.cap:
             self.cap.release()
 
+self.category_colors = {}
+for category in used_colors:
+    color_name = used_colors[category]
+    self.category_colors[category] = AVAILABLE_COLORS.get(color_name, (255, 255, 255))
+
 # ---- Flask routes go below (same as your last working ones) ----
